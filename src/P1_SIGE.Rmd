@@ -1,0 +1,1443 @@
+---
+title: "Pre-procesamiento de datos y clasificación binaria"
+author: "Irene Béjar Maldonado (irenebejar@correo.ugr.es)"
+date: "11/4/2020"
+output: 
+  html_document:
+    theme: default
+    highlight: tango
+    df_print: paged
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    collapsed: false
+    code_folding: show
+    number_sections: true
+bibliography: references.bib
+nocite: '@*'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, error=FALSE, warning=FALSE, message=FALSE, paged.print=TRUE, attr.output='style="max-height: 300px;"')
+```
+```{r  include=FALSE}
+library (dplyr)
+library(readr)
+library(VIM)
+library(funModeling)
+library(caret)
+library(GoodmanKruskal)
+library(corrplot)
+library(tidyverse)
+library(mice)
+library(imputeMissings) # Para imputar valores usando la moda
+library(VIM) # Para imputar valores usando KNN
+library(corrplot) # Librería corrplot para dibujar la matrix de correlaciones
+library(ranger) # Librería para el RF
+library(pROC) # Para pintar la curva ROC
+library(Information) #For WOE and IV
+
+# Semilla para que todo sea reproducible
+set.seed(16)
+# Cojemos un subconjutno de los dato de manera aleatoria
+train <- read_csv("train_sample.csv")
+train_clean <- train
+test <- read_csv("test_sample.csv")
+```
+
+# Introducción
+
+El objetivo de esta práctica es resolver un problema de pre-procesamiento y aprendizaje automático. El problema consiste en predecir si una transacción online es fraudulenta o no (isFraud) a partir del resto de variables. El ejercicio se abordará como un problema de clasificación binaria, con dos posibles salidas: {Yes, No}. La selección de datos y el procesamiento queda a criterio del estudiante.
+
+Para abordar esta práctica se ha hecho uso del lenguaje R para las tareas de preprocesamiento de los datos y entrenamiento de los modelos. 
+
+A continuación se explicará las distintas aproximaciones que se han hecho con el fin de resolver el problema planteado.
+
+# Análisis exploratorio de los datos
+
+Con el fin de entender mejor la naturaleza de los datos para darles un tratamiento correcto hace falta realizar un análisis exploratorio de los mismos. Los datos que se van a utilizar para el problema corresponden a la competición de [Kaggle IEE-CIS Fraud Detection.][data_set_url]
+
+Los datos vienen separados en dos datasets ```transaction``` e ```identity``` y se unen a través de atributo ```TransactionID```.
+Para ```transaction``` el dataset tiene las siguientes medidas:
+
+- Train: 590540 Filas and 394 Columnas
+- Test:  506691 Filas and 393 Columnas
+
+Para ```identity``` el dataset tiene las siguientes medidas:
+
+- Train: 144233 Rows and 41 Columns
+- Test:  141907 Rows and 41 Columns
+
+A simple vista se puede comprobar que no todas las identificaciones tienen transacciones asociadas.
+
+Una vez unidos ambos dataset, para ```train``` obtenemos un dataframe con 590,540 observaciones y 435 variables. Aquí se puede identificar otro gran problema que presenta estos datos y es su gran dimensionalidad, no solo por el número de observaciones, si no por el número de variables que se utilizan para describir una transacción. Vamos a continuación explicar, dentro de lo posible, que significan cada una de estas variables.
+
+Debido al gran tamaño del dataset ha sido necesario **tomar una muestra de 100 mil ejemplos** para poder trabajar con los datos de manera más o menos fluida.
+
+En la información de la competición se dice que de las 439 variables las siguientes contienen información categórica:
+
+- ProductCD
+- card1 - card6
+- addr1, addr2
+- Pemaildomain Remaildomain
+- M1 - M9
+- DeviceType
+- DeviceInfo
+- id12 - id38
+
+## Significado de las variables del dataset
+Para entender mejor la naturaleza de los datos se han usado análisis exploratorios de los disponibles en Kaggle por dos motivos, el primero es la dificultad de realizar un análisis exploratorio con todas las muestras ya que ocupan demasiado en memoria, el segundo que son muchos más extensos y precisos que los que pueda realizar yo.
+
+Los dos análisis que se han usado son:
+
+- [IEE extensive EDA $ LGB with R][extensive_eda]
+- [IEEE-CIS Fraud Detection - Detecting Fraud from Customer Transactions][other_eda]
+
+Se va a explicar el significado de las variables que se han utilizado durante las pruebas, al menos de aquellas variables de las que se conoce el significado.
+
+### isFraud
+Esta es la variable objetivo. Es de tipo categórico con 2 niveles: 0 si la transacción **no** se considera fraudulenta y 1 si lo es. Al mostrar la distribición de esta variable nos encontra que está extremadamente imbalanceado, a penas el 3% de los dos corresponden a los casos positivos de fraude. Esto es el otro gran problema del dataset, al estar tan imbalanceado puede inducir a los modelos de predicción a devolver solo resultados de la clase mayoritaria, lo que hará que a la hora de predecir en el conjunto de test obtengamos un resultado pésimo. Para minimizar este efecto se tienen que usar si o si técnicas de balanceado de las clases.
+
+```{r}
+freq(data = train, input='isFraud')
+```
+
+### TransactionDT 
+Es una variable numérica que corresponde al tiempo que ha pasado desde una determinada fecha. Este valor esta tomado en segundos y hay un espacio de tiempo entre las muestras tomadas para train y las muestras tomadas para test, como se muestra a continuación.
+
+![gráfica_deltatime](https://scontent.fewr1-6.fna.fbcdn.net/v/t1.0-9/85017113_630229201128279_6557518761446866944_n.jpg?_nc_cat=102&_nc_ohc=TQVD3XiXKvYAX_4E6HE&_nc_ht=scontent.fewr1-6.fna&oh=f1160f4d4907f3e9aa2391241bb5a6d3&oe=5ED4BC3F)
+
+### TransactionAmt
+La cantidad de dinero que se mueve en una transacción. Lo único destacable de esta variable son los *outliers* que contiene. Se verán en la segunda prueba.
+
+### Card1 a Card6
+Variables de tipo categórico. Contienen información acerca de la tarjeta que se ha usado en una trasacción, por ejemplo si son tarjetas de débito o de crédito. También contiene otra información que está encriptada.
+
+### Addr1 y Addr2
+En uno de los EDA mencionados anteriormente se dice que esta variable es un importante predictor del fraude. Addr1 contien la información de la región de facturación de los compradores, mientras que Addr2 contiene el país.
+
+### V1 - V339
+Corresponden a las *Vesta enginereed rich features*, es decir, características que el proveedor de los datos, Vesta Coorporation, ha incluido a la hora de tomar los datos. Incluye datos encriptados que no se sabe qué significan. Son variables de tipo numérico y algunas de ellas están muy relacionadas entre si.
+
+### P_emaildomain
+Está variables también se indica que es buena predictora. Contiene el dominio del email de los compradores.
+
+
+
+[data_set_url]: https://www.kaggle.com/c/ieee-fraud-detection/data
+[extensive_eda]: https://www.kaggle.com/psystat/ieee-extensive-eda-lgb-with-r
+[other_eda]: https://nycdatascience.com/blog/student-works/ieee-cis-fraud-detection-detecting-fraud-from-customer-transactions/
+
+
+# Primera prueba con el dataset
+En esta primera prueba que se ha realizado el obetivo principal que se ha intentado alcanzar es el de reducir la dimensionalidad de los datos lo máximo posible. Esto se ha hecho a través de: quitar las variables que contengan muchos datos NA (datos nulos), quitar todas las variables que estén relacionadas entre si, quitar las variables poco relacionadas con la variable objetivo y. por último, balancear el dataset quitando muestras de la clase minoritaria.
+
+A continuación se describirán cada uno de los pasos seguidos.
+
+> Antes de empezar, hay que aclarar que esta primera prueba se hizó antes de realizar el análisis exploratorio mencionado anteriormente. Solamente se realizo un breve análisis para mostrar las relaciones entre las variables y la cantidad de valores NA que había en el dataset.
+
+Las librerías usadas drante esta primera prueba han sido:
+
+```{r eval=FALSE, results='hide'}
+library (dplyr)
+library(readr)
+library(VIM)
+library(funModeling)
+library(caret)
+library(GoodmanKruskal)
+library(corrplot)
+library(tidyverse)
+#library(amap) # Para la blurt table
+library(mice)
+library(imputeMissings) # Para imputar valores usando la moda
+library(VIM) # Para imputar valores usando KNN
+library(corrplot) # Librería corrplot para dibujar la matrix de correlaciones
+library(ranger) # Librería para el RF
+library(pROC) # Para pintar la curva ROC
+library(Information) #For WOE and IV
+```
+
+Cargamos los datasets:
+
+```{r eval=FALSE, results='hide'}
+# Semilla para que todo sea reproducible
+set.seed(16)
+# Cojemos un subconjutno de los dato de manera aleatoria
+train <- read_csv("train_sample.csv")
+train_clean <- train
+test <- read_csv("test_sample.csv")
+```
+
+## Preprocesamiento de los datos
+Para realizar el preprocesamiento se ha partido del dataset de train que contiene 100 mil muestras de los datos.
+
+### Coversión de variables y eliminación de NA
+Lo primero es convertir la variables que sabemos que son categóricas a factors de R. Después se han eliminado todas aquellas variables que presenten más de un 5% de varoles perdidos. El motivo de esto reside en que como tenemos tantas variables que no sabemos muy bien como se relacionan entre si no importa perder aquellas que tengan una gran cantidad de valores NA, ya que aportan poca información.
+
+```{r results='hide'}
+# Convertimos las variables categóricas a factors
+train_clean %<>%
+  mutate_at(vars(id_12:id_38, DeviceType, DeviceInfo), as.factor) %>%
+  mutate_at(vars(isFraud, ProductCD, card1:card6, addr1, addr2,
+                 P_emaildomain, R_emaildomain, M1:M9), as.factor)
+```
+
+El estado en el que se encuentra el dataset es el siguiente:
+```{r}
+df_status(train_clean)
+```
+
+Podemos ver que muchas de las columnas contienen un alto porcentaje de valores NA (columna ```p_na```)
+
+Borramos aquellas columnas con más de un 5% de valores NA. Las columnas que quedan son las siguientes:
+
+```{r results='hold'}
+# Se eliminan las columnas con más del 5% de valores NaN
+train_clean <- train_clean[, which(colMeans(!is.na(train_clean)) > 0.95)]
+colnames(train_clean)
+```
+
+Después de esto se procede a tratar las variables categóricas y las variables numéricas por separado, ya que tienen propiedades distintas.
+
+### Tratamiento de las variables categóricas
+Para realizar el preprocesamiento de las variables categóricas se ha decidido separarlas por grupos porque tiene sentido que dos variables que pertenecen al mismo grupo, por ejemplo al grupo que da información sobre las tarjetas, estén más relacionadas entre si y se pueda extraer más información de ellas.
+
+El **primer grupo** que se analiza es el de las **variables que contienen información sobre la tarjeta** que se usa.
+
+```{r}
+card_variables = select (train_clean, isFraud,card1:card6)
+```
+
+Para ver la relación que existe entre ellas y si se puede descartar alguna se ha utilizado el método de [Goodman and Kruskal’s tau][GK_measure]. Esta medida se usa para medir la asociación que existe entre variables categóricas y se apoya en otras como *chi-cuadrado* para determinar este grado de relación. 
+
+> A parte de este método se intentó usar previamente otros como CCA (Canonical Correspondence Analysis) pero no dió resultados debido a que algunas variables tienen mucha diversidad en las categorías que contienen y al aplicar los métodos no hay memoria disponible para realizar los cálculos necesarios. Más tarde, me di cuenta de que tener variables categóricas de este tipo no es bueno a la hora de realizar predicciones y es necesario reducir su diversidad o eliminarlas si no aportan mucha información.
+
+El resultado que se obtiene al aplicar el método es el siguiente:
+```{r}
+GK_card_varibles<- GKtauDataframe(card_variables)
+plot(GK_card_varibles, corrColors = "blue")
+```
+
+En el gráfico anterior podemos ver el resultado. En la diagonal se muestra el número de etiquetas diferentes que existe para la categoría en cuestión. Después se muestra la relación entre las distintas variables. Esta relación no es bidireccional, ya que indica como de bien se puede explicar o deducir una variable en función de otra. Es decir, por ejemplo, con la variable card1 (fila) se pueden decir muy bien el resto (columnas), pero no al revés. A partir de la variable card2 no podemos predecir los valores que va a tener card1.
+
+Basandonos en lo anterior con las **columnas card1, card2 y card5** podemos predecir el resto. 
+
+Vamos a continuar **haciendo imputación de los datos** para estas variables. Para ello se van a usar todas las variables que ofrecen información de la tarjeta y el método de los **K vecinos más cercanos** del paquete VIM. Se ha elegido este método ya que permite deducir los valores que faltan en función de los valores que contienen los vecinos más cercanos a la observación que se está imputando, funciona tanto en variables numéricas como en variables categóricas y es rápido y no necesita mucha memoria para realizar las operaciones.
+
+```{r}
+# Cogemos las variables card solo para hacer la imputación
+card_clean = subset(card_variables, select = c(card1:card6))
+
+# Hacemos la imputación
+card_clean <- kNN(card_clean, variable = c("card2", "card5"))
+card_clean = subset(card_clean, select = c(card1,card2, card5))
+
+# Actualizamos el resto del dataset con los cambios realizados
+train_clean <- subset(train_clean, select = -c(card1:card6))
+train_clean <- cbind(train_clean, card_clean)
+```
+
+```{r include=FALSE}
+# Eliminamos los dataframes no necesarios
+rm(card_variables, card_clean, train, test, GK_card_varibles) ; invisible(gc())
+```
+
+A continuación procedemos con el **segundo grupo de variables categóricas**. Este solo está formado por la **variable ProductCD**. Debido a elimar las variables con más del 5% de valores perdidos hemos gran parte de las estas variables ya que en su mayoría todas tienen más del 10% de valores perdidos.
+
+Como solo tenemos una variable vamos a realizar la imputación usando la moda.
+```{r}
+# La única columna que queda categórica es ProductCD, se le van a imputar valores usando la moda
+productCD <- select (train_clean, ProductCD)
+productCD <- impute(productCD, object = NULL, method = "median/mode", flag = FALSE)
+
+# Se actializa el dataset con los datos de la imputación
+train_clean <- subset(train_clean, select = -c(ProductCD))
+train_clean <- cbind(train_clean, productCD)
+```
+
+```{r include=FALSE}
+# Eliminamos los dataframes no necesarios
+rm(productCD) ; invisible(gc())
+```
+
+[GK_measure]: https://www.r-bloggers.com/to-eat-or-not-to-eat-thats-the-question-measuring-the-association-between-categorical-variables/
+
+
+### Tratamiento de las variables numéricas
+Aquí lo que vamos a hacer primero es quitar todas las variables que estén altamente relacionadas con otras, ya que no aportan ninguna información nueva. Después vamos a quitar aquellas variables que estén poco relacionadas con la variable objetivo porque no se puede deducir su comportamiento a partir de ellas.
+
+Seleccionamos las variables numéricas del dataset:
+```{r}
+numeric_variables <- select_if(train_clean, is.numeric)
+df_status(numeric_variables)
+```
+
+En las variables numéricas podemos ver que no hay tantos valores perdidos como en las categóricas, por lo que hemos conservado muchas variables.
+
+Con la matriz de correlación comprobamos la cantidad de variables dependientes entre si. Antes de eso vamos a quitar aquellas variables cuya desviación estándar sea cero o casi cero, ya que al tener siempre el mismo valor no llegan a aportar información alguna.
+```{r}
+# Quitamos los  near-zero variance predictors
+nvz = nearZeroVar(numeric_variables)
+numeric_variables_without_zero <- numeric_variables[ ,-nvz]
+
+# Calculamos la correlación
+correlation <- cor(numeric_variables_without_zero, use="complete.obs")
+# Dibujamos la matriz 
+corrplot(correlation, type="lower", method = "color",tl.cex = 0.1)
+```
+
+Podemos ver que hay un gran número de variables relacionas. En su mayoría corresponden a las V1-V339 (Vesta enginereed rich features). Eliminamos las variables que por encima del 75% de relación para intentar quitar el máximo número posible. Estás son las columnas que se van a desechar:
+
+```{r}
+# Eliminamos las variables relacionadas entre si
+hc = findCorrelation(correlation, cutoff=0.75) # Eliminamos por encima de 75%
+hc = sort(hc)
+data_to_drop = numeric_variables[,c(hc)]
+colnames(data_to_drop)
+
+# Quitamos las columnas descartadas de nuestro dataset
+drops <- colnames(data_to_drop)
+train_clean <- train_clean[ , !(names(train_clean) %in% drops)]
+```
+
+A continuación, vamos a ver como de relacionadas están las variables que han quedado con la variable objetivo. Para ello hemos pasado la variable objetivo a tipo numérico para poder aplicar las operaciones.
+
+Las columnas que se van a eliminar son aquellas que tengan una relación por debajo del 2%. Asumimos que con menos de esto las variables se pueden considerar independientes.
+```{r}
+# Primero pasasmos todas las variables a número
+data_numeric <- select_if(train_clean, is.numeric)
+data_numeric$isFraud <- as.numeric(train_clean$isFraud)
+
+# Calculamos la correlación
+cor_target <- correlation_table(data_numeric, target='isFraud')
+
+# Eliminamos todas las variables por debajo de 0.02
+data_to_drop <- cor_target %>% 
+  filter(abs(isFraud) < 0.02)
+
+# Quitamos las columnas descartadas de nuestro dataset
+drops <- data_to_drop$Variable
+train_clean <- train_clean[ , !(names(train_clean) %in% drops)]
+```
+
+Después de realizar todo esto lo único que quedaría sería normalizar los datos. En esta primera prueba no se planteo ya que como la naturaleza de los datos son identificadores, valores encriptados, valores binarios (ceros y unos), etc, no se vió conveniente realizar una normalizacización.
+
+Con esto damos el preprocesamiento de los datos concluidos y pasamos al entrenamiento de los modelos de predicción.
+
+## Entrenamiento de los modelos de predicción
+
+Para los modelos de predicción se han elegido Random Forest y XGBoost (Extreme Grandient Boosting). El motivo pricinpal es que ambos son bastantes rápidos ya que están basados en árboles. A parte de esto se presentan más razones:
+
+- **Random Forest:** 
+  1. Basado en árboles
+  2. Puede lidiar con variables categóricas
+  3. Se comporta bien cuando el conjunto de datos tiene una gran dimensionalidad.
+  4. Rápido a la hora de entrenar
+  5. Tiene un buen rendimiento ante dataset imbalaceados ya que minimiza la tasa de error de todo el conjunto.
+
+- **XGBoost:**
+  1. Muy rápido.
+  2. Muy conveniente cuando se tienen grandes cantidades de datos que son una mezcla de variables categóricas y variables numéricas.
+  3. Se ha usado mucho en esta misma competición de Kaggle junto con LightGBM.
+  
+Para su entrenamiento se ha usado la librería ```caret```.
+
+### Preparando los datos
+
+Antes de proceder al entrenamiento de los modelos hay que tratar los datos de alguna manera para lidiar con el imbalaceo de las clases. Para este problema existen [3 posibles alternativas][subsampling_methods]:
+
+1. ***Down-sampling***: Consiste en igualar el número de muestras de cada clase quitando ejemplos de la clase mayoritaria de manera aleatoria.
+2. ***Up-sampling***: Se crean ejemplos aleatorios, mediante reemplazamiento, de la clase minoritaria hasta igualar el número de ejemplos que hay en la clase con más muestras.
+3. ***Métodos híbridos***: Aplican down-sample a la clase mayoritaria y up-sample a la clase minoritaria. 
+
+Estas técnicas se pueden aplicar antes de introducir los datos en el modelo de entrenamiento, o bien, se pueden aplicar durante el entrenamiento cuando se van cogiendo muestras de los datos.
+
+Para esta primera prueba se ha obtado por aplicar down-sampling antes de introducir los datos en el modelo. También se ha optado por eliminar aquellas filas que contienen NA, ya que eran muy pocas y todas se encontraban en la clase mayoritaria.
+
+Para el segundo modelo de predicción (XGBoost), hemos aplicado una transformación a las variables categóricas porque al contener tantas etiquetas diferentes al modelo le resulta imposible entrenar con ellas. En un primer momento se optó por el One Hot Encoding, pero es inviable. Por este motivo se ha usado [WOE (*weight of evidence*)][woe]. Este valor nos indica la capacidad predictiva que tiene una variable independiente respecto a una variable dependiente. Indica la probabilidad de que se de o no un determinado suceso, en este caso el suceso es que una transacción sea fraude o no. En definitiva, usando este valor, la variable categórica pasa de tener un valor discreto a un valor continuo, por lo que es más fácil trabajar con ella. 
+```{r}
+# Por último balanceamos los datos 
+# Comprobamos cuantos ejemplos hay de cada clase
+sum(!complete.cases(train_clean))
+data_dirty <- train_clean[rowSums(is.na(train_clean)) > 0,]
+
+
+#Vamos a elimar las filas con na
+train_final <- na.omit(train_clean)
+
+# Vamos a aplicar una transformación a las variables categóricas para el segundo modelo que vamos a entrenar
+# https://www.listendata.com/2015/03/weight-of-evidence-woe-and-information.html
+categorical_variables <- select_if(train_final, is.factor)
+categorical_variables <-
+  categorical_variables %>%
+  mutate(isFraud = as.numeric(ifelse(isFraud == '1', 1, 0)))
+IV <- create_infotables(data=categorical_variables, y="isFraud", parallel=FALSE)
+
+train_final2 <- left_join(train_final, IV$Tables$card2, by="card2")
+train_final2$card2 <- train_final2$WOE
+train_final2[, c("WOE", "IV", "Percent", "N")] <- list(NULL)
+
+train_final2 <- left_join(train_final2, IV$Tables$card5, by="card5")
+train_final2$card5 <- train_final2$WOE
+train_final2[, c("WOE", "IV", "Percent", "N")] <- list(NULL)
+
+train_final2 <- left_join(train_final2, IV$Tables$ProductCD, by="ProductCD")
+train_final2$ProductCD <- train_final2$WOE
+train_final2[, c("WOE", "IV", "Percent", "N")] <- list(NULL)
+
+# Eliminamos objetos intermedios
+rm(categorical_variables, IV) ; invisible(gc())
+
+# Nos aseguramos de que la variable objetivo es un factor
+train_final <-
+  train_final %>%
+  mutate(isFraud = as.factor(ifelse(isFraud == 1, 'Yes', 'No')))
+
+train_final2 <-
+  train_final2 %>%
+  mutate(isFraud = as.factor(ifelse(isFraud == 1, 'Yes', 'No')))
+
+# Separamos en entrenamiento y validación 
+trainIndex <- createDataPartition(train_final$isFraud, p = .75, list = FALSE)
+train <- train_final[trainIndex, ]
+train2 <- train_final2[trainIndex, ]
+val   <- train_final[-trainIndex, ]
+val2   <- train_final2[-trainIndex, ]
+
+#Downsapling
+down_train <- downSample(x = train,
+                         y = train$isFraud)
+down_train <- down_train[, -which(names(down_train) == "Class")]
+
+down_train2 <- downSample(x = train2,
+                         y = train2$isFraud)
+down_train2 <- down_train2[, -which(names(down_train2) == "Class")]
+
+freq(data = down_train, input='isFraud')
+```
+
+En el gráfico anterior se puede ver el resultado del down-sampling de los datos. También el algoritmo que se ha usado para la transformación de las variables categóricas para el segundo modelo ha desechado la columna ```card1``` por tener más de 1000 etiquetas.
+
+Con lo anterior hemos obtenido dos conjuntos de entrenamiento y dos conjuntos de validación. Se usarán de la siguiente forma:
+
+- Random forest: ```down_train``` y ```val```
+- XGBoost: ```down_train2``` y ```val2```
+
+El tamaño es el mismo para los dos modelos.
+```{r include=FALSE}
+# Eliminamos los objetos innecesarios
+rm(cor_target, correlation, data_dirty, data_numeric, data_to_drop) ; invisible(gc())
+rm(numeric_variables, numeric_variables_without_zero, train_clean) ; invisible(gc())
+rm(drops, hc, nvz) ; invisible(gc())
+
+# Eliminamos los obejtos innecesarios
+rm(trainIndex) ; invisible(gc())
+```
+
+
+[subsampling_methods]: https://topepo.github.io/caret/subsampling-for-class-imbalances.html#resampling
+[woe]: https://www.listendata.com/2015/03/weight-of-evidence-woe-and-information.html
+
+### Entrenamiento de los modelos 
+
+El primer modelo que se entrenó fue **Random Forest** con el conjunto de entrenamiento que no tiene ningún tratamiento para las variables categóricas. Al ser un conjunto bastante pequeño (solo tenemos 5316 filas) se deció ajustar los hiperparámetros directamente con él.
+
+```{r}
+# Comprobamos el valor estimado de mtry
+sqrt(ncol(down_train))
+```
+
+El valor estimado para el parámetro mtry (el único ajustable) se calcula haciendo la raíz cuadrada del número de columnas. Obtenemos un valor de 6, por lo que vamos a hacer una busqueda de este valor entre 1 y 15 para ver si encontramos un modelo mejor.
+
+```{r eval=FALSE}
+# Control para el entrebamiento
+# Repetimos 3 veces el cross validation con 10 subconjuntos
+control <- trainControl(method='repeatedcv', 
+                        number=10, 
+                        repeats=3, 
+                        search='grid',
+                        classProbs = TRUE, 
+                        summaryFunction = twoClassSummary)
+
+tunegrid <- expand.grid(.mtry = (1:15)) 
+
+rf_fit <- train(isFraud ~ ., 
+                    data = train,
+                    method = 'rf',
+                    metric = 'ROC',
+                    trControl = control,
+                    tuneGrid = tunegrid)
+```
+
+El resultado que se obtiene es que el modelo no fue capaz de terminar el entrenamiento tras más de 6 horas, a pesar de que el dataset que se ha usado para entrenar es bastante pequeño. Se llegó a la conclusión de que el problema se encontraba en las variables categóricas, ya que al tener demasiada diversidad en sus valores hace más complicado la creación de los árboles. Por ello se decidió usar como segundo modelo XGBoost y aplicar un tratamiento a los valores categóricos para acelerar este proceso.
+
+Para ajustar los parámetros de XGBoost se ha usado una búsqueda aleatoria ya que hay bastantes y en la documentación no se indica demasiado bien el efecto que produce cada uno sobre el entrenamiento.
+
+```{r include=FALSE}
+load("xgb_model.RData")
+load("xgb_best_tune.RData")
+```
+
+```{r eval=FALSE}
+control_xgb <- trainControl(method='repeatedcv', 
+                            number=5, 
+                            repeats=3, 
+                            search='random',
+                            classProbs = TRUE, 
+                            summaryFunction = twoClassSummary)
+
+xgb_fit <- train(isFraud ~ ., 
+                     data = down_train,
+                     method = 'xgbTree',
+                     metric = 'ROC',
+                     trControl = control_xgb)
+
+print(xgb_fit)
+```
+
+Los resultados obtenidos son los mostrados anteriormente. Aunque este modelo ha sido capaz de acabar, el tiempo de entrenamiento ha superado las 2 horas, lo que sigue siendo demasiado respecto al tamaño del conjunto de entrenamiento. 
+
+Ahora vamos a validar el modelo y a mostrar el valor AUC y la curva ROC que conseguimos.
+
+```{r eval=FALSE}
+# Validamos
+predictionValidationProb <- predict(xgb_fit, val2, type = "prob")
+auc1 <- roc(val$isFraud, predictionValidationProb[[1]], levels = unique(val[["isFraud"]]))
+roc_validation1 <- plot.roc(auc1, ylim=c(0,1), type = "S" , print.thres = T, main=paste('Validation AUC:', round(auc1$auc[[1]], 2)))
+
+auc_xgb_fit <- round(auc1$auc[[1]], 2)
+```
+
+![roc](roc_xgb_fit.png)
+
+## Resultados
+En esta primera prueba los resultados no han sido demasiado buenos. Aunque se ha reducido el número de columnas y el número de muestras no ha sido suficiente para que los modelos entrenen con la suficiente rapidez. La calidad de las variables elegidas tampoco ha sido la adecuada. Con datos sin normalizar y variables categóricas con mucha diversidad podemos estar influyendo en que produzcamos un modelo sesgado.
+
+Para la segunda prueba que se haga es necesario principalmente dos cosas: primero, reducir dimensionalidad con técnicas que nos garanticen que no perdemos información o bien basandonos en un análisis explotario de los datos que nos garanticen las variables que son buenas predictoras. Segundo, dar tratamiento a las variables categóricas y eliminar o transformar aquellas con muchos nieveles. También hay que tener encuenta otro método de balanceo de los datos, ya que hacer un down-sampling tan agresivo no representa la manera en la que se encuentran los datos en realidad, lo que puede hacer que perdamos precisión.
+
+```{r include=FALSE}
+rm(list = ls()) ; invisible(gc())
+```
+
+
+# Segunda prueba
+En esta segunda prueba fue cuando se decidió estudiar otros análisis exploratorios de los datos ya que el que había realizado por mi cuenta era insuficiente para entender el dataset. Con esto se querían alcanzar 2 objetivos principales:
+
+1. Ver que variables son innecesarias para la predicción que se tiene que realizar
+2. Entender los datos para poder darles un tratamiento mejor.
+
+Tras comprobar varios análisis exploratorios se llegó a la conclusión de que solo algunas variables categóricas del dataset eran realmente buenos predictores, las demás debido a que no se saben el significado real de los valores que presentan o al tener una distribución similar tanto para las transacciones que son fraude o como para las que no, no aportan demasiada información. Por este motivo esta segunda prueba se va a **centrar solo en las variables numéricas** del dataset, para ver si se pueden conseguir resultados mejores, o igualar al menos, a la de la prueba anterior.
+
+Las librerías usadas para esta segunda prueba han sido:
+```{r}
+library(readr) # Para leer los datos
+library (dplyr) # Para usar el operador %>%
+library(caret)
+library(corrplot) # Pintar la matiz de covarianza
+library(funModeling) # Para la función df_status
+library(FactoMineR) #PCA
+library(factoextra) # Análisis PCA
+library(mice) # Para imputar los datos
+library(Hmisc) # Para imputar valores usando la moda
+library(pROC) # Para pintar la curva ROC
+```
+
+```{r}
+# Semilla para que todo sea reproducible
+set.seed(16)
+# Cojemos un subconjutno de los dato de manera aleatoria
+train <- read_csv("train_sample.csv")
+train_clean <- train
+```
+
+
+## Preprocesamiento de los datos
+Como se ha mencionado anteriormente, en esta segunda prueba se quiere reducir la dimensionalidad, pero con cierto criterio, con el fin de no perder información que puede ser importante. Para esto se va a usar **PCA**.
+
+> El objetivo de PCA (*Principal Component Analysis*) es la reducción de la dimensionalidad (variables), perdiendo la menor cantidad de información posible (varianza): cuando contamos con un gran número de variables cuantitativas posiblemente correlacionadas (indicativo de existencia de información redundante), PCA permite reducirlas a un número menor de variables transformadas (componentes principales) que expliquen gran parte de la variabilidad en los datos.
+
+Para conseguir esto PCA se basa en el calculo de componentes principales que son una combinación lineal normalizada de las variables originales de un dataset. Es decir, el resultado de aplicar PCA nos devuelve una serie de componentes principales que explican la varianza de nuestros datos. Estas componentes se encuentran normalizas y reducen el número de dimensión necesarias para representar los datos.
+
+Esta técnica la vamos a aplicar solo a las variables numéricas del dataset.
+
+### Aplicando PCA
+Lo primero que vamos a hacer es quedarnos con las variables numéricas del dataset. De estás variables numéricas se van a eliminar aquellas que tengan más de un 40% de valores perdidos. Se deberían eliminar las que tienen un 50%, ya que en estás es muy dificil imputar datos, pero debido al gran número de columnas con valores perdidosy al número de variables se ha decidido aumentar un poco este umbral. 
+
+```{r}
+# Transformamos las variables categóricas
+train_clean %<>%
+  mutate_at(vars(id_12:id_38, DeviceType, DeviceInfo), as.factor) %>%
+  mutate_at(vars(isFraud, ProductCD, card1:card6, addr1, addr2,
+                 P_emaildomain, R_emaildomain, M1:M9), as.factor)
+
+# Deberíamos eliminar variables con más de un 50% de valores perdidos, pero vamos a hacer un eliminación un poco más fuerte
+# y vamos a borrar aquellas que tengan más de un 40%
+train_clean <- train_clean[, which(colMeans(!is.na(train_clean)) > 0.60)]
+# Hemos reducido la mitad de las columnas
+
+# Ahora nos quedamos con las variables numéricas
+numeric_variables <- select_if(train_clean, is.numeric)
+numeric_variables$isFraud <- as.numeric(ifelse(train_clean$isFraud == '1', 1, 0))
+```
+
+```{r include=FALSE}
+# Para ahorrar memoria eliminamos los datsets innecesarios por ahora
+rm(train, train_clean) ; invisible(gc())
+```
+
+Después vamos a eliminar los outliers de las columnas que se indican en este [análisis exploratorio][other_eda]. Para las columnas numéricas la única que tienen outliers que se pueden tratar es ```TransactionAmt``` que inidica la cantidad de dinero. En el resto los datos están tan dispersos que al quitar los "outliers" perdemos demasiadas observaciones.
+
+```{r}
+# TansactionAmt antes de eliminar ouliers
+boxplot(numeric_variables$TransactionAmt)$out
+# Eliminamos los outliers https://www.r-bloggers.com/how-to-remove-outliers-in-r/
+outliers <- boxplot(numeric_variables$TransactionAmt, plot=FALSE)$out
+numeric_variables<- numeric_variables[-which(numeric_variables$TransactionAmt %in% outliers),]
+# TraasntionAmt despues
+boxplot(numeric_variables$TransactionAmt)$out
+```
+
+En los gráficos anteriores se puede comprobar que los datos quedan mucho más compactados.
+
+```{r include=FALSE}
+# Eliminamos avriables inncesarias para ahorrar memoria
+rm(outliers) ; invisible(gc())
+```
+
+Lo siguiente que vamos a hacer, siguiendo también el análisis exploratorio anterior, es eliminar variables del grupo ```V1-V339``` que recordemos corresponden a las *Vesta enginereed rich features*. Son variables que están encriptadas y no se saben que significado tienen. Para reducir el número de estás variables vamos a usar la matriz de correlación para reducir su número.
+
+```{r}
+# Luego eliminamos valores de las columnas V utlizando la matriz de covarianza
+# Nos quedamos solo con las V y la variable objetivo
+v_variables <- select(numeric_variables, starts_with("V"))
+
+# Quitamos los  near-zero variance predictors
+nvz = nearZeroVar(v_variables)
+v_variables <- v_variables[ ,-nvz]
+
+# Calculamos la correlación
+correlation <- cor(v_variables, use="complete.obs")
+# Dibujamos la matriz 
+corrplot(correlation, type="lower", method = "color",tl.cex = 0.1)
+# Eliminamos las variables relacionadas entre si
+hc = findCorrelation(correlation, cutoff=0.75) # Eliminamos por encima de 75%
+hc = sort(hc)
+data_to_drop = v_variables[,c(hc)]
+colnames(data_to_drop)
+
+# Quitamos las columnas descartadas de nuestro dataset
+drops <- colnames(data_to_drop)
+numeric_variables <- numeric_variables[ , !(names(numeric_variables) %in% drops)]
+```
+
+En el gráfico anterior podemos ver que muchas variables están muy relacionadas tanto positiva como negativamente. Esto indica que aportan información duplicada y que podemos eliminarlas sin más. Se han decartado todas aquellas que tienen **más de un 75% de correlación**. En la salida anterior también se muestran que columnas han sido descartadas.
+
+```{r include=FALSE}
+# Eliminamos avriables inncesarias para ahorrar memoria
+rm(data_to_drop, nvz, hc, v_variables, drops, correlation) ; invisible(gc())
+```
+
+Una vez realizado esto tenemos los datos listos para aplicar PCA. El estado del dataset hasta este momento es el siguiente:
+```{r}
+df_status(numeric_variables)
+```
+
+Tenemos 132 variables, algunas de ellas aún tienen datos perdidos que tienen que ser imputados. Antes de realizar PCA sobre todo el conjunto de datos, se va a hacer una pequeña prueba con una muestra para ver si, efectivamente, se reduce la dimensionalidad de manera considerable.
+
+Apartamos un subconjunto de 3000 muestras, eliminamos la variable objetivo y quitamos las columnas cuya desviación estándar sea cero o muy cercana a cero.
+```{r}
+# Vamos a realizar el PCA. Como es una técnica costosa en compuatación y tenemos un dataset demasiado grande vamos a coger
+# un subconjunto de 3000 filas para realizar las pruebas
+data_pca <- sample_n(numeric_variables[complete.cases(numeric_variables), ], 3000)
+freq(data = data_pca, input='isFraud')
+
+# Eliminamos la variable objetivo para hacer PCA
+data_pca.isFraud <- data_pca$isFraud
+data_pca$isFraud <- NULL
+
+# Limpiamos las columnas con nzv que hayan podido surgir
+nvz = nearZeroVar(data_pca)
+data_pca <- data_pca[, -nvz]
+```
+
+En la muestra comprobamos que el desbalanceo de las clases es similar al del conjunto original.
+
+Vamos a aplicar PCA a esta muestra usando el paquete ```factoMineR```. Para la visualización de los resultados vamos a usar ```factoextra```.
+
+```{r}
+# PCA
+res_pca.sample <- PCA(data_pca, scale.unit = TRUE, ncp = 5, graph = TRUE)
+```
+
+En el gráfico se pueden ver los vectores de los eigenvalues para las dos primeras dimensiones. Cuanto más alejados estén del centro de la circuferencia mejor representan a esas dimensiones. Se puede comprobar que todos están bastantes alejados.
+
+
+```{r}
+# Eigen values
+eig.val <- get_eigenvalue(res_pca.sample)
+fviz_eig(res_pca.sample, addlabels = TRUE, ylim = c(0, 20))
+```
+
+Los eigenvalues indican la proporción de la varianza del dataset que explica cada dimensión. Este valor nos sirve para decidir cuantas dimensiones son necesarias para representar nuestro dataset. La suma de todos los eigenvalues es 1, indicando que con todas las dimensiones se representa el 100% de la varianza.
+
+En el gráfico anterior se muestra el valor de los eigenvalues para las 10 primeras dimensiones. A continuación vamos a mostrar los eigenvalues para todas las dimensiones.
+
+```{r}
+eig.val
+```
+
+En total con tan solo 58 dimensiones hemos sido capaces de representar toda la varianza de los datos, es decir, se ha reducido el tamaño de las variables a menos de la mitad (antes de aplicar PCA teníamos 132 variables). Pero aún se puede reducir más si consideramos que un porcentaje por debajo de 100 es suficiente para representar nuestros datos. **Para elegir el número de dimensiones he decido elegir hasta que el incremento de la varianza deja de ser significativo.** En este caso concreto me quedaría con las 22 primeras dimensiones que explican el 90% de la varianza, ya que a partir de aquí el incremento que se tiene es muy poco significativo (las 36 variables restantes solo aportan un 10% de la varianza).
+
+Esta prueba podemos considerarla satisfactoria, por lo que vamos a aplicar PCA a todo el conjunto de datos.
+
+> Para aplicar PCA al conjunto de todos los datos se ha usado la función ```prcomp``` en vez de la proporcionada por el paquete ```factoMineR```, ya que esta segunda pide elegir el número de dimensiones que se quieren conservar antes de aplicar la función.
+
+```{r include=FALSE}
+# Borramos los objetos temporales
+rm(data_pca, data_pca.isFraud, eig.val, pca_sample, res_pca.sample, nvz) ; invisible(gc())
+```
+
+Antes de aplicar PCA debemos imputar los valores perdidos. Para las variables del grupo V1-V339 se van a imputar valores usando la mediana, ya que debido a la gran cantidad no se ha podido aplicar ningún otro método. Para el resto de variables se va a utilizar el paquete ```MICE``` para realizar la imputación.
+
+> Para las variables V1-V339 se ha intentado usar también los K vecinos más cercanos y random forest, pero exigía demasiada memoria y la sesión de R abortaba.
+
+```{r}
+# Columnas V
+v_variables <- select(numeric_variables, starts_with("V"))
+#colnames(v_variables)
+# Imputamos usando la moda
+for(i in colnames(v_variables)){
+  if(sum(is.na(v_variables[[i]])) != 0){
+    v_variables[[i]] <- as.numeric(Hmisc::impute(v_variables[[i]], fun=median))
+  }
+}
+
+#df_status(v_variables)
+
+# Resto de los datos
+rest_of_data <- select(numeric_variables, -starts_with("V"))
+
+# Para imputarlos vamos a usar mice
+names(which(colSums(is.na(rest_of_data))>0))
+imputed_data <- mice(rest_of_data, m=1, maxit = 5, method = 'cart', seed = 16)
+rest_of_data <- complete(imputed_data)
+
+#df_status(rest_of_data)
+
+# Juntamos de nuevo los dataset
+data_pca <- cbind(rest_of_data, v_variables)
+data_pca.isFraud <- data_pca$isFraud
+data_pca$isFraud <- NULL
+
+# ELiminamos columnas que hayan podido quedar con una varianza igual a cero
+# Solo se pierde una columna
+data_pca <- data_pca[ , which(apply(data_pca, 2, var) != 0)]
+```
+
+```{r include=FALSE}
+# Eliminamos variables intermedias
+rm(imputed_data, numeric_variables, rest_of_data, v_variables, i) ; invisible(gc())
+```
+
+```{r}
+# Usando otra función para calcular el PCA
+pca <- prcomp(data_pca, scale = TRUE, center=TRUE, retx=TRUE)
+summary(pca)
+```
+
+Aquí podemos ver el resultado de aplicar PCA. Igual que antes seleccionamos dimensiones hasta que el incremento deje de ser significativo. **Con las 34 primeras componentes explicamos el 89% de la varianza de los datos.**
+
+```{r}
+# Seleccionamos las componentes que nos hagan falta
+comp <- as.data.frame(pca$x)
+comp <- comp[, 1:34]
+comp$isFraud <- data_pca.isFraud
+```
+
+```{r include=FALSE}
+# Borramos los objetos que no hagan falta
+rm(data_pca, pca, data_pca.isFraud) ; invisible(gc())
+```
+
+Con esto hemos finalizado el preprocesamiento de los datos y vamos a proceder a entrenar los modelos.
+
+## Entrenamiento de los modelos
+Al igual que en la prueba anterior los modelos que se han usado son Random Forest y XGBoost. Vamos a ver a continuciación como se han procesado los datos y ajustado los hiperparámetros.
+
+### Preparando los datos
+En la primera prueba comprobamos que la técnica de down-sampling no fue demasiado buena de cara al entrenamiento. Debido a esto se investigó un poco más acerca de cómo se pueden balancear los datos. En la [documentación de las funciones para balancear los datos][sampling_docu] sé indica que realizan el balanceado durante la validación cruzada se obtienen mejores resultados que haciendolo previamente. También se va a cambiar a una técnica híbrida ya que parece mejor alternativa que realizar solo downsampling de los datos.
+
+[sampling_docu]: https://topepo.github.io/caret/subsampling-for-class-imbalances.html#resampling
+
+### Entrenamiento de los modelos
+En esta segunda prueba el dataset que tenemos para entrenar es bastante más grande que el que teníamos en la primera prueba, así que, vamos a coger un conjunto más pequeño de los datos (5000 ejemplos) para ajustar los parámetros de los modelos.
+
+```{r eval=FALSE}
+# Ahora vamos a proceder a entrenar los modelos, primero con el dataset pequeño para poder encontrar unos buenos 
+# valores de hiperparametros y después con el grande
+
+# Separamos un pequeño conjunto de muestras para entrenar el modelo
+small <- sample_n(comp, 5000)
+freq(data = small, input='isFraud')
+
+# Pasamos a factor isFraud
+small <-
+  small %>%
+  mutate(isFraud = as.factor(ifelse(isFraud == 1, 'Yes', 'No')))
+
+
+# Separamos en validación y train
+trainIndex <- createDataPartition(small$isFraud, p = .75, list = FALSE)
+train_small <- small[trainIndex, ]
+val_small   <- small[-trainIndex, ]
+```
+
+Para random forest obtenemos un valor de ```mtry``` muy similar al de la prueba anterior, por lo que vamos a usar el mismo grid para buscar el valor óptimo.
+
+```{r eval=FALSE}
+# Random forest
+
+# Valor de mtry estimado
+sqrt(ncol(comp_sample))
+sqrt(ncol(comp))
+
+# Entrenamos el modelo
+
+control <- trainControl(method='repeatedcv', 
+                        number=10, 
+                        repeats=3, 
+                        search='grid',
+                        classProbs = TRUE, 
+                        summaryFunction = twoClassSummary,
+                        sampling = "smote") # Opción para balancear durante el cross-validation
+
+tunegrid <- expand.grid(.mtry = (1:15)) 
+
+rf_fit_pca <- train(isFraud ~ ., 
+                       data = train_small,
+                       method = 'rf',
+                       metric = 'ROC',
+                       trControl = control,
+                       tuneGrid = tunegrid)
+print(rf_fit_pca)
+
+rf_pca_best_tune <- rf_fit_pca$bestTune
+```
+
+```{r include=FALSE}
+load("rf_pca_best_tune.RData")
+```
+
+El resultado de la búsqueda es un valor de mtry de 7.
+
+Para XGBoost la búsqueda de parámetros se va a realizar de manera aleatoria de nuevo.
+
+```{r eval=FALSE}
+# XGBOOST
+control_xgb <- trainControl(method='repeatedcv', 
+                        number=10, 
+                        repeats=3, 
+                        search='random',
+                        classProbs = TRUE, 
+                        summaryFunction = twoClassSummary,
+                        sampling = "smote")
+
+xgb_fit_pca <- train(isFraud ~ ., 
+                    data = train_small,
+                    method = 'xgbTree',
+                    metric = 'ROC',
+                    trControl = control_xgb)
+print(xgb_fit_pca)
+
+xgb_pca_best_tune <- xgb_fit_pca$bestTune
+```
+
+```{r include=FALSE}
+load("xgb_pca_best_tune.RData")
+```
+
+Una vez que tenemos los parámetros ya si que se procede a entrenar sobre todo el cojunto de datos usando los hiperparámetro que hemos buscado.
+
+```{r}
+# Ahora vamos a entrenar con todos los datos y los parámetros que hemos buscado
+# Pasamos a factor isFraud
+data <-
+  comp %>%
+  mutate(isFraud = as.factor(ifelse(isFraud == 1, 'Yes', 'No')))
+
+# Separamos en validación y train
+trainIndex <- createDataPartition(data$isFraud, p = .75, list = FALSE)
+train <- data[trainIndex, ]
+val   <- data[-trainIndex, ]
+```
+
+
+```{r eval=FALSE}
+# Random Forest
+control <- trainControl(method='repeatedcv', 
+                        number=5, 
+                        repeats=2, 
+                        search='grid',
+                        classProbs = TRUE, 
+                        summaryFunction = twoClassSummary,
+                        sampling = "smote")
+
+tunegrid <- rf_best_tune 
+
+rf_fit_pca <- train(isFraud ~ ., 
+                    data = train,
+                    method = 'rf',
+                    metric = 'ROC',
+                    trControl = control,
+                    tuneGrid = tunegrid)
+print(rf_fit_pca)
+```
+
+```{r include=FALSE, message=TRUE}
+load("rf_pca_model.RData")
+```
+
+Validamos el modelo
+
+```{r}
+# Validamos
+predictionValidationProb <- predict(rf_fit_pca, val, type = "prob")
+auc1 <- roc(val$isFraud, predictionValidationProb[[1]], levels = unique(val[["isFraud"]]))
+roc_validation1 <- plot.roc(auc1, ylim=c(0,1), type = "S" , print.thres = T, main=paste('Validation AUC:', round(auc1$auc[[1]], 2)))
+
+auc_rf_fit_pca <- round(auc1$auc[[1]], 2)
+```
+
+Obtenemos un área bajo la curva del 96% sobre el conjunto de validación. En el caso de random forest hemos superado con creces la prueba anterior donde ni siquiera se pudo terminar el entrenamiento del modelo. En este caso el **tiempo total de entrenamiento**, incluyendo la búsqueda de parámetros, apenas ha alcanzado los **45 minutos.**
+
+Ahora es el turno del XGBoost. Primero entrenamos.
+
+```{r eval=FALSE}
+# XGBOOST
+control_xgb <- trainControl(method='repeatedcv', 
+                            number=5, 
+                            repeats=2, 
+                            search='grid',
+                            classProbs = TRUE, 
+                            summaryFunction = twoClassSummary,
+                            sampling = "smote")
+
+tunegrid_xgb <- xgb_best_tune
+
+xgb_fit_pca <- train(isFraud ~ ., 
+                     data = train,
+                     method = 'xgbTree',
+                     metric = 'ROC',
+                     trControl = control_xgb,
+                     tuneGrid = tunegrid_xgb)
+print(xgb_fit_pca)
+```
+
+```{r inlude=FALSE}
+load("xgb_pca_model.RData")
+print(xgb_fit_pca)
+```
+
+Y validamos el modelo a continuación
+
+```{r}
+# Validamos
+predictionValidationProb <- predict(xgb_fit_pca, val, type = "prob")
+auc1 <- roc(val$isFraud, predictionValidationProb[[1]], levels = unique(val[["isFraud"]]))
+roc_validation1 <- plot.roc(auc1, ylim=c(0,1), type = "S" , print.thres = T, main=paste('Validation AUC:', round(auc1$auc[[1]], 2)))
+
+auc_xgb_fit_pca <- round(auc1$auc[[1]], 2)
+```
+
+El resultado que obtenemos en este caso es similar al de la prueba anterior 85% de área bajo la curva, pero en un tiempo muchísimo menor. Incluyendo la búsqueda de parámetros apenas ha tardado 25 minutos.
+
+## Resultados
+Con esta prueba podemos decir que hemos cumplido con los objetivos que se habían propuesto. El tiempo de entrenamiento se ha reducido de manera muy notoria, el tratamiento que le hemos dado a los datos nos ha permitido reducir dimensionalidad sin perder apenas información sobre su comportamiento. Los resultados de esto es que hemos obtenido modelos predictores mucho mejores (al menos mirando el valor de AUC).
+
+La única pega que se le puede poner a esta prueba es que hemos utilizado solo las variables numéricas sin tener en cuenta las variables categóricas, cuando además, utilizamos un modelo (XGBoost) que sabemos que funciona mucho mejor usando variables de los dos tipos. 
+
+```{r include=FALSE}
+rm(list = ls()) ; invisible(gc())
+```
+
+# Tercera prueba
+Esta prueba se realizó para ver si efectivamente el uso de variables categóricas hacía que, efetivamente, los modelos mejorasen (al menos XGBoost). Se va a realizar un pequeño análisis de las variables categóricas que tenemos para poder usarlas tal cual, sin tener que procesarlas previamente (como pasó en la primera prueba). 
+
+Las librerías que se han usado en esta prueba son:
+```{r}
+library(readr) # Para leer los datos
+library (dplyr) # Para usar el operador %>%
+library(caret)
+library(funModeling) # Para la función df_status
+library(pROC) # Para pintar la curva ROC
+library(forcats) # Para el tratamiento de factors
+```
+
+```{r}
+# Semilla para que todo sea reproducible
+set.seed(16)
+# Cojemos un subconjutno de los dato de manera aleatoria
+train <- read_csv("train_sample.csv")
+train_clean <- train
+```
+
+## Preprocesamiento de los datos
+Igual que en la prueba anterior nos centramos en las variables numéricas, en esta nos vamos a centrar en las variables categóricas. De las variables que queden al eliminar las columnas con más del 40% de NA, vamos a ver la diversidad en sus valores, la cantidad de datos que hay por clase, los outliers que nos encontremos, etc.
+
+Para realizar esto se ha usado la biblioteca ```forcats``` que contiene un montón de métodos para tratar factors de R de manera muy sencilla.
+
+Lo primero que vamos a hacer es eliminar aquellas variables con más del 40% y transformar las variables que son categóricas para poder seleccionarlas.
+
+```{r}
+# Transformamos las variables categóricas
+train_clean %<>%
+  mutate_at(vars(id_12:id_38, DeviceType, DeviceInfo), as.factor) %>%
+  mutate_at(vars(isFraud, ProductCD, card1:card6, addr1, addr2,
+                 P_emaildomain, R_emaildomain, M1:M9), as.factor)
+
+# Deberíamos eliminar variables con más de un 50% de valores perdidos, pero vamos a hacer un eliminación un poco más fuerte
+# y vamos a borrar aquellas que tengan más de un 40%
+train_clean <- train_clean[, which(colMeans(!is.na(train_clean)) > 0.60)]
+# Hemos reducido la mitad de las columnas
+
+# Ahora nos quedamos con las variables categoricas
+factor_variables <- select_if(train_clean, is.factor)
+df_status(factor_variables)
+```
+
+Sin incluir la variable objetivo, tenemos un total de 11 variables categóricas. Algunas, ya se puede ver, que tienen muchísimos valores para las clases. A continuación se va a ir decidiendo que hacer con cada una.
+
+### Tratamiento de los factors
+Vamos a ver un resumen de las variables que tenemos para empezar a trabajar.
+
+```{r}
+summary(factor_variables)
+```
+
+A partir del resultado anterior ya se pueden tomar varias decisiones. La primera es que ```ProductCD``` está perfecta, no hay que hacerle nada. La segunda es que se van a eliminar ```card1``` y ```card2```. La primera porque contiene 7714 valores únicos y no parece que haya un grupo predominante entre estos (la etiqueta 'Other' sería la clase mayoritaria si decidiesemos considerar solo 6 clases). La segunda por el mismo motiva, pero además añadiendo que los valores perdidos tienen un gran peso.
+
+```{r}
+# card1 y card2 se van a eliminar porque tienen demasiada diversidad en sus valores como para tratarlos
+factor_variables$card1 <- NULL
+factor_variables$card2 <- NULL
+```
+
+
+Vamos a continuar ahora con la variable **card3**. Vamos a ver como se distribuyen los valores.
+
+```{r}
+# En card3 vamos a conservar un nº limitado de categorías (5 probablemente)
+factor_variables %>%
+  count(card3, sort = TRUE)
+```
+
+Hay una clase que es claramente mayoritaria, la etiqueta ```150```. Los valores NA tienen también más frecuencia que otras clases por lo que se van a considerar una clase por si mismos. De esta variable se van a considerar las 5 clases con más frecuencia el resto se van a englobar bajo la etiqueta ```Other```.
+
+```{r}
+# En card3 el valor 150 contiene casi todos los demás valores, así que se van a hacer 5 categorías, los NA se van a considerar
+# una categoría también
+factor_variables %<>% mutate(card3 = fct_explicit_na(card3)) %>% mutate(card3 = fct_lump(card3, n = 5))
+factor_variables %>%count(card3, sort = TRUE)
+```
+
+La siguiente variable es **card4**. La distribución es.
+
+```{r}
+# card4 los NA van a pasar a ser una categoría
+factor_variables %>%count(card4, sort = TRUE)
+```
+
+```card4``` contiene la compañía de la tarjeta que se ha utilizado en la transferencia. Las etiquetas están bastante bien balanceadas, hay poco tipos distintos. El único tratamiento que se va a dar es considerar los NA como una categoría nueva, para indicar que no se conoce el proveedor.
+
+```{r}
+factor_variables <- factor_variables %>% mutate(card4 = fct_explicit_na(card4))
+factor_variables %>%count(card4, sort = TRUE)
+```
+
+Vamos a continuar con **card5**. La distribución es:
+
+```{r}
+# En card5 vamos a conservar también un nº limitado de categorías
+factor_variables %>%count(card5, sort = TRUE)
+```
+
+Entre las 10 primeras etiquetas los valores paracen estar bastante bien distribuidos, así que se van a mantener. Los valores NA pasarán a formar parte de la etiqueta ```Other```.
+
+```{r}
+# Aquí nos encontramos que los valores están ligeranmente más repartidos, vamos a mantener 10 categorías y a considerar también 
+# los NA como una categoría
+factor_variables %<>% mutate(card5 = fct_explicit_na(card5)) %>% mutate(card5 = fct_lump(card5, n = 10))
+factor_variables %>%count(card5, sort = TRUE)
+```
+
+Continuamos con la variable **card6**. La distribución es.
+
+```{r}
+factor_variables %>%count(card6, sort = TRUE)
+```
+
+Hay dos clases mayoritarias. Las etiquetas ```debit or credit``` y ```charge card``` se pueden considerar *outliers* ya que parecen (por el significado) que pertenecen a la clase mayoritaria, así que se van a añadir aquí. Los NA se consideran una clase a parte indicando que no se sabe de que tipo es la tarjeta.
+
+```{r}
+# En card6 vamos a eliminar los outliers charge card y debit or credit van a pasar a la clase mayoritaria debit
+# Los NA se quedan como una categoría a parte
+factor_variables %<>% mutate(card6 = fct_explicit_na(card6)) %>%
+  mutate(card6 = fct_recode(card6, debit = "debit or credit", debit = "charge card"))
+factor_variables %>%count(card6, sort = TRUE)
+```
+
+La siguiente variable es **addr1**. La distribución es.
+
+```{r}
+factor_variables %>%count(addr1, sort = TRUE)
+nlevels(factor_variables$addr1)
+```
+
+La clase mayoritaria serían los valores perdidos. En esta categoría exiten 173 valores diferentes. Se van a conservar los NA como una clase y vamos a reducir a la mitad el número de etiquetas, para no perder muchos valores ya que en el análisis exploratorio se indica que esta es una variable importante para predecir el fraude.
+
+```{r}
+# La clase mayoritaría en este caso serían los valores perdidos, se van a conservar
+factor_variables %<>% mutate(addr1 = fct_explicit_na(addr1)) %>% mutate(addr1 = fct_lump(addr1, n = 86))
+factor_variables %>%count(addr1, sort = TRUE)
+```
+
+Continuamos con **addr2**.
+
+```{r}
+# addr2 vamos a quedarnos con la mitad de las categorías
+factor_variables %>%count(addr2, sort = TRUE)
+nlevels(factor_variables$addr2)
+```
+
+Está en la misma situación que ```addr1``` por lo que se le va a dar el mismo tratamiento.
+
+```{r}
+# Los NA también se van a considerar una clase ya que hay muchos
+factor_variables %<>% mutate(addr2 = fct_explicit_na(addr2)) %>% mutate(addr2 = fct_lump(addr2, n = 18))
+factor_variables %>%count(addr2, sort = TRUE)
+```
+
+La siguiente es **P_emaildomain**.
+
+```{r}
+factor_variables %>%count(P_emaildomain, sort = TRUE)
+```
+
+Las 6 primeras categórias son las que más número de valores concetran así que son las que se van a conservar. Para los NA se va a seguir la misma estrategia, se van a mantener indicando que no se conoce el email.
+
+```{r}
+# P_emaildomain se va a quedar un 6 categorias, los valores NA se van a conservar como una categoría
+factor_variables %<>% mutate(P_emaildomain = fct_explicit_na(P_emaildomain)) %>% mutate(P_emaildomain = fct_lump(P_emaildomain, n = 6))
+factor_variables %>%count(P_emaildomain, sort = TRUE)
+```
+
+Y la última variable es **M6**.
+
+```{r}
+factor_variables %>%count(M6, sort = TRUE)
+```
+
+Parece una variable de tipo binario, pero los valores perdidos tienen casi la misma frecuencia, así que se van a considerar como un tercer valor.
+
+```{r}
+# M6 los valores NA van a pasar a ser una categoría
+factor_variables <- factor_variables %>% mutate(M6 = fct_explicit_na(M6))
+factor_variables %>%count(M6, sort = TRUE)
+```
+
+Después de todo este tratamiento el resultado que hemos obtenido es el siguiente:
+
+```{r}
+# Comprobamos como han quedado las variables
+summary(factor_variables)
+```
+
+Las etiquetas de cada variable han quedado razonadamente balanceadas y hemos reducido mucho el número de etiqueta diferentes englobando aquellas con una frecuencia muy pequeña. Lo único que falta es juntar estas variables con el resultado del PCA de la prueba anterior y ya tendríamos los datos listos para entrenar los modelos.
+
+### Agrupamiento  de todas las variables
+Se van a eliminar las mismas filas que se desacharon al hacer el tratamiento de los outliers de la columnas ```TransactionAmt```. Después se van a juntar los datos con el resultado que se obtuvo tras aplicar PCA.
+
+```{r}
+# Vamos a añadir las variables categóricas sin más tratamiento al resultado del PCA de la prueba anterior y vamos
+# a entrenar los modelos
+
+
+# Ahora nos quedamos con las variables numéricas
+numeric_variables <- select_if(train_clean, is.numeric)
+numeric_variables$isFraud <- as.numeric(ifelse(train_clean$isFraud == '1', 1, 0))
+
+# Para eliminar las mismas filas
+factor_variables$TransactionAmt <- numeric_variables$TransactionAmt
+
+# Para ahorrar memoria eliminamos los datsets innecesarios por ahora
+# rm(train, train_clean) ; invisible(gc())
+
+# Identificar columnas con outliers
+# Vamos a quitar los outliers siguiendo el EDA realizado en esta página
+# https://nycdatascience.com/blog/student-works/ieee-cis-fraud-detection-detecting-fraud-from-customer-transactions/
+
+# Las columnas donde exiten outliers son TransactionAmt, (dist1 y dist) -> categóricas
+# Vamos a mostrar gráficas de estas columnas
+
+# TansactionAmt antes de eliminar ouliers
+#boxplot(numeric_variables$TransactionAmt)$out
+# Eliminamos los outliers https://www.r-bloggers.com/how-to-remove-outliers-in-r/
+outliers <- boxplot(numeric_variables$TransactionAmt, plot=FALSE)$out
+numeric_variables<- numeric_variables[-which(numeric_variables$TransactionAmt %in% outliers),]
+# TraasntionAmt despues
+#boxplot(numeric_variables$TransactionAmt)$out
+
+# Eliminamos las mismas filas en los factors
+factor_variables<- factor_variables[-which(factor_variables$TransactionAmt %in% outliers),]
+factor_variables$TransactionAmt <- NULL 
+
+```
+
+```{r include=FALSE}
+# Eliminamos avriables inncesarias para ahorrar memoria
+rm(outliers, numeric_variables) ; invisible(gc())
+```
+
+
+```{r}
+# Cargamos el dataset con los resultados del PCA
+load("dataset_PCA.RData")
+
+# eliminamos una de las columnas isFraud
+factor_variables$isFraud <- NULL
+
+# Añadimos las nuevas variables
+data <- cbind(comp, factor_variables)
+
+```
+
+```{r include=FALSE}
+# Eliminamos variables innecesarias
+rm(comp, factor_variables, train, train_clean) ; invisible(gc())
+```
+
+
+## Entrenamiento de los modelos
+Aquí se va a usar la misma técnica que en la prueba anterior, se va a hacer una búsqueda de parámetros con un conjunto pequeño y después con esos parámetros se entrenará sobre el conjunto total
+
+### Entrenamiento 
+```{r eval=FALSE}
+# Entrenamos los modelos igual que en la prueba anterior
+
+# Ahora vamos a proceder a entrenar los modelos, primero con el dataset pequeño para poder encontrar unos buenos 
+# valores de hiperparametros y después con el grande
+
+# Separamos un pequeño conjunto de muestras para entrenar el modelo
+small <- sample_n(data, 5000)
+freq(data = small, input='isFraud')
+
+# Pasamos a factor isFraud
+small <-
+  small %>%
+  mutate(isFraud = as.factor(ifelse(isFraud == 1, 'Yes', 'No')))
+
+
+# Separamos en validación y train
+trainIndex <- createDataPartition(small$isFraud, p = .75, list = FALSE)
+train_small <- small[trainIndex, ]
+val_small   <- small[-trainIndex, ]
+
+
+# Random forest
+
+# Valor de mtry estimado
+sqrt(ncol(data))
+
+# Entrenamos el modelo
+
+# Explicar porque vamos a usar el resampling de los datos dentro del modelo
+control <- trainControl(method='repeatedcv', 
+                        number=10, 
+                        repeats=3, 
+                        search='grid',
+                        classProbs = TRUE, 
+                        summaryFunction = twoClassSummary,
+                        sampling = "smote")
+
+tunegrid <- expand.grid(.mtry = (1:15)) 
+
+rf_fit_pca_factor <- train(isFraud ~ ., 
+                    data = train_small,
+                    method = 'rf',
+                    metric = 'ROC',
+                    trControl = control,
+                    tuneGrid = tunegrid)
+print(rf_fit_pca_factor)
+
+rf_pca_factor_best_tune <- rf_fit_pca_factor$bestTune
+
+# Guardamos los parámetros en un fichero
+save(rf_pca_factor_best_tune, file="rf_pca_factor_best_tune.RData")
+#25
+
+# XGBOOST
+control_xgb <- trainControl(method='repeatedcv', 
+                            number=10, 
+                            repeats=3, 
+                            search='random',
+                            classProbs = TRUE, 
+                            summaryFunction = twoClassSummary,
+                            sampling = "smote")
+
+xgb_fit_pca_factor <- train(isFraud ~ ., 
+                     data = train_small,
+                     method = 'xgbTree',
+                     metric = 'ROC',
+                     trControl = control_xgb)
+print(xgb_fit_pca_factor)
+
+xgb_pca_factor_best_tune <- xgb_fit_pca_factor$bestTune
+# 10
+
+# Guardamos los parámetros en un fichero
+save(xgb_pca_factor_best_tune, file="xgb_pca_factor_best_tune.RDS")
+
+```
+
+
+```{r include=FALSE}
+# Eliminamos variables innecesarias
+rm(small, val_small, train_small) ; invisible(gc())
+
+```
+
+```{r}
+# Entrenamos los modelos con los parámetros que hemos buscado
+
+# Ahora vamos a entrenar con todos los datos y los parámetros que hemos buscado
+# Pasamos a factor isFraud
+data <-
+  data %>%
+  mutate(isFraud = as.factor(ifelse(isFraud == 1, 'Yes', 'No')))
+
+# Separamos en validación y train
+trainIndex <- createDataPartition(data$isFraud, p = .75, list = FALSE)
+train <- data[trainIndex, ]
+val   <- data[-trainIndex, ]
+```
+
+```{r eval=FALSE}
+# Random Forest
+control <- trainControl(method='repeatedcv', 
+                        number=5, 
+                        repeats=2, 
+                        search='grid',
+                        classProbs = TRUE, 
+                        summaryFunction = twoClassSummary,
+                        sampling = "smote")
+
+tunegrid <- rf_pca_factor_best_tune
+
+rf_fit_pca_factor <- train(isFraud ~ ., 
+                    data = train,
+                    method = 'rf',
+                    metric = 'ROC',
+                    trControl = control,
+                    tuneGrid = tunegrid)
+print(rf_fit_pca_factor)
+# 20
+
+# Guardamos el modelo
+save(rf_fit_pca_factor, file="rf_pca_factor_model.RData")
+save(auc_rf_fit_pca_factor, file="auc_result_rf_pca_factor.RData")
+
+# XGBOOST
+control_xgb <- trainControl(method='repeatedcv', 
+                            number=5, 
+                            repeats=2, 
+                            search='grid',
+                            classProbs = TRUE, 
+                            summaryFunction = twoClassSummary,
+                            sampling = "smote")
+
+tunegrid_xgb <- xgb_pca_factor_best_tune
+
+xgb_fit_pca_factor <- train(isFraud ~ ., 
+                     data = train,
+                     method = 'xgbTree',
+                     metric = 'ROC',
+                     trControl = control_xgb,
+                     tuneGrid = tunegrid_xgb)
+print(xgb_fit_pca_factor)
+
+# Guardamos el modelo
+save(xgb_fit_pca_factor, file="xgb_pca_factor_model.RData")
+save(auc_xgb_fit_pca_factor, file="auc_result_xgb_pca_factor.RData")
+```
+
+### Resultados del entrenamiento 
+Esta vez los modelos han tardado un poco más en entrenar, sobre todo Random Forest, pero aún así no han llegado a los tiempos que se obtuvieron en la primera prueba.
+
+Para **Random Forest** la búsqueda de parámetros ha tardado unos 25 minutos, después el entrenamiento sobre todo el conjunto han sido unos 20 minutos. En total 45. Se puede comprobar que la inclusión de variables cateóricas hace que aumente el tiempo de entrenamiento de los modelos.
+
+Para **XGBoost** la búsqueda de parámetros ha durado 10 minutos y el entrenamiento 15. Aún teniendo las variables categóricas ha sido muy rápido.
+
+Vamos a ver los resultados de la validación de los modelos, en teoría, XGBoost debería mejorar.
+
+```{r include=FALSE}
+load("rf_pca_factor_model.RData")
+load("xgb_pca_factor_model.RData")
+```
+
+
+**Validación para Random Forest**
+Obtenemos el mismo resultado que en la prueba anterior.
+
+```{r}
+# Validamos
+predictionValidationProb <- predict(rf_fit_pca_factor, val, type = "prob")
+auc1 <- roc(val$isFraud, predictionValidationProb[[1]], levels = unique(val[["isFraud"]]))
+roc_validation1 <- plot.roc(auc1, ylim=c(0,1), type = "S" , print.thres = T, main=paste('Validation AUC:', round(auc1$auc[[1]], 2)))
+
+auc_rf_fit_pca_factor <- round(auc1$auc[[1]], 2)
+```
+
+**Validación para XGBoost**
+Para este modelo el uso de las variables categóricas si que ha hecho que aumente muy considerablemente el área bajo la curva ROC. Tal y como se esperaba.
+
+```{r}
+# Validamos
+predictionValidationProb <- predict(xgb_fit_pca_factor, val, type = "prob")
+auc1 <- roc(val$isFraud, predictionValidationProb[[1]], levels = unique(val[["isFraud"]]))
+roc_validation1 <- plot.roc(auc1, ylim=c(0,1), type = "S" , print.thres = T, main=paste('Validation AUC:', round(auc1$auc[[1]], 2)))
+
+auc_xgb_fit_pca_factor <- round(auc1$auc[[1]], 2)
+```
+
+## Resultados
+En esta tercera prueba hemos comprobado que el uso de variables categóricas puede afectar al comportamiento de los modelos de predicción. En algunos casos haciendo que mejoren, en otros haciendo que procesen los datos de manera más lenta. 
+
+Esta será la última prueba que se realizará ya que se han obtenido resultados muy satisfactorios en cuanto a los valores de AUC en el conjunto de validación.
+
+
+# Conclusiones
+A lo largo de esta memoria se ha podido apreciar lo difícil que resulta buscar un buen conjunto de variables que sirvan para clasificar un conjunto de datos.
+
+Esta práctica ha supuesto un reto importante ya que los datos que se manejaban correspondían a un caso real. Uno de los problemas principales que se ha tenido que abordar era el problema de la memoria. Al manejar tantos datos se hacía muy difícil, ya no solo aplicar técnicas sobre los datos, si no incluso cargar los datasets. Esto, sin embargo, es un problema que te puedes encontrar en la vida real y también hay que ponerle solución.
+
+Respecto a la dificultad del reto, supongo, que la mayoría de veces que te enfrentas a un conjunto de datos no sabes el significado de las variables, o bien, hay tantas variables que es imposible hacer un estudio con todas. En el caso de este dataset se ha dado un poco de ambos casos. Ante estas situaciaciones hay que aplicar técnicas que permitan reducir los datos, hacer gráficas que permitan ver el comportamiento respecto de otras variables, aplicar modelos sencillos para tener una base sobre la importancia de las variables, y sobre todo, ensayo y error a la hora de decidir qué variables son las buenas. En esta práctica no se ha podido realizar todo lo anteriormente mencionado, pero a través de la investigación que he hecho para poder desarrollarla y a base de "pelearme" con los datos he aprendido cosas nuevas que me serán útiles en el futuro cuando tenga que enfrentarme a una situación similar.
+
+```{r eval=FALSE, include=FALSE}
+load("auc_result_rf_fit_pca.RData")
+load("auc_result_rf_fit_pca_factor.RData")
+load("auc_result_xgb_fit.RData")
+load("auc_result_xgb_fit_pca.RData")
+load("auc_result_xgb_fit_pca_factor.RData")
+
+comparation <- matrix(c(auc_xgb_fit, auc_rf_fit_pca, 
+                         auc_xgb_fit_pca, auc_rf_fit_pca_factor,
+                         auc_xgb_fit_pca_factor),
+                         ncol=1,byrow=TRUE)
+
+colnames(comparation) <- c("AUC")
+rownames(comparation) <- c("XGB 1º Prueba","RF  2º Prueba","XGB 2º Prueba", "RF  3º Prueba", "XGB 3º Prueba")
+comparation <- as.table(comparation)
+comparation
+```
+
+# Referencias
